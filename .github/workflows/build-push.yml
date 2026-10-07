@@ -2,17 +2,31 @@ name: Build and push
 
 on:
   schedule:
-    - cron: "37 * * * *" # run every hour to poll for new releases
+    - cron: "37 * * * *" # poll upstream for new releases every hour
   workflow_dispatch:
     inputs:
       version:
-        description: "Which version to force build and push (e.g.: 1.20.9)"
+        description: "Version to build (e.g. 1.20.9). Leave blank to build the latest upstream release. Manual runs always build."
         required: false
         default: ""
         type: string
 
+# Least privilege by default; only the "record" job gets write access.
 permissions:
-  contents: write
+  contents: read
+
+# Never run two builds at once (avoids racing on tags and the state file).
+concurrency:
+  group: build-and-push
+  cancel-in-progress: false
+
+env:
+  # EDIT THESE if you are running this under your own account
+  DOCKERHUB_USER: "pinheadtf2"
+  IMAGE: "pinheadtf2/copypinny"
+  GHCR_IMAGE: "ghcr.io/pinheadtf2/copypinny"
+  UPSTREAM_REPO: "9001/copyparty"
+  STATE_FILE: ".github/last_upstream_release.txt"
 
 jobs:
   check:
@@ -20,78 +34,82 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version: ${{ steps.check.outputs.version }}
-      current_version: ${{ steps.check.outputs.current_version }}
       latest_version: ${{ steps.check.outputs.latest_version }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Check latest upstream release
+      - name: Decide whether to build
         id: check
         env:
-          VERSION_OVERRIDE: ${{ github.event.inputs.version || '' }}
+          VERSION_OVERRIDE: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          current="$(cat .github/last_upstream_release.txt 2>/dev/null || true)"
-          should_build=false
+          current="$(cat "$STATE_FILE" 2>/dev/null || true)"
+          latest=""
 
-          api_ok=false
-          latest_version=""
-
+          # Look up the latest upstream release (may fail; handled below)
           if raw_tag="$(curl --silent --show-error --fail \
-              --retry 5 \
-              --retry-all-errors \
-              --retry-delay 2 \
-              --connect-timeout 10 \
-              --max-time 30 \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 10 --max-time 30 \
               -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/9001/copyparty/releases/latest" \
-              | jq -r '.tag_name')"; then
-            if [ -n "$raw_tag" ] && [ "$raw_tag" != "null" ]; then
-              latest_version="${raw_tag#v}"
-              api_ok=true
-            fi
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+              | jq -r '.tag_name // empty')"; then
+            latest="${raw_tag#v}"
           fi
 
-          if [ -n "$VERSION_OVERRIDE" ]; then
-            version="$VERSION_OVERRIDE"
+          should_build=false
+          version=""
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual runs ALWAYS build, regardless of the recorded version.
+            version="${VERSION_OVERRIDE#v}"
+            version="${version:-$latest}"
+            if [ -z "$version" ]; then
+              echo "::error::No version given and the latest upstream release could not be determined."
+              exit 1
+            fi
             should_build=true
-          elif [ "$api_ok" = "true" ]; then
-            version="$latest_version"
-
-            if [ "$version" != "$current" ]; then
-              if printf '%s\n%s\n' "$current" "$version" | sort -C -V; then
-                should_build=true
-              fi
-            fi
-          else
-            # API failed and no manual version override: skip quietly
-            version="$current"
-            should_build=false
-            echo "GitHub API request failed after retries; skipping this run."
+          elif [ -z "$latest" ]; then
+            echo "::warning::Could not fetch the latest upstream release; skipping this run."
+          elif [ "$latest" != "$current" ] \
+               && [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)" = "$latest" ]; then
+            # Scheduled run and upstream has something newer than what we last built
+            version="$latest"
+            should_build=true
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "latest_version=$latest_version" >> "$GITHUB_OUTPUT"
-          echo "current_version=$current" >> "$GITHUB_OUTPUT"
-          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          {
+            echo "should_build=$should_build"
+            echo "version=$version"
+            echo "latest_version=$latest"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Show decision
-        run: |
-          echo "should_build    = ${{ steps.check.outputs.should_build }}"
-          echo "current_version = ${{ steps.check.outputs.current_version }}"
-          echo "build_version   = ${{ steps.check.outputs.version }}"
-          echo "latest_version  = ${{ steps.check.outputs.latest_version }}"
+          {
+            echo "### Build decision"
+            echo "| Key | Value |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`$GITHUB_EVENT_NAME\` |"
+            echo "| Should build | \`$should_build\` |"
+            echo "| Last built | \`${current:-none}\` |"
+            echo "| Latest upstream | \`${latest:-unknown}\` |"
+            echo "| Version to build | \`${version:-none}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 120 # emulated multi-arch builds can be slow
+    permissions:
+      contents: read
+      packages: write # needed to push to GHCR
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - variant: ac
@@ -114,28 +132,34 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: "0x464e"
+          username: ${{ env.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute tags
         id: tags
+        env:
+          VARIANT: ${{ matrix.variant }}
+          VERSION: ${{ needs.check.outputs.version }}
+          LATEST_VERSION: ${{ needs.check.outputs.latest_version }}
         run: |
           set -euo pipefail
 
-          variant="${{ matrix.variant }}"
-          version="${{ needs.check.outputs.version }}"
-          latest_version="${{ needs.check.outputs.latest_version }}"
-          image="0x464e/patentparty"
+          tags="${IMAGE}:${VARIANT}-${VERSION}"
 
-          tags="${image}:${variant}-${version}"
+          # Only move the "latest" tags when building the current upstream release
+          if [ "$VERSION" = "$LATEST_VERSION" ]; then
+            tags+=$'\n'"${IMAGE}:${VARIANT}-latest"
 
-          # only push "latest" tags when building the current upstream latest version
-          if [ "$version" = "$latest_version" ]; then
-            tags+=$'\n'"${image}:${variant}-latest"
-
-            # also push plain "latest" tag for the "ac" variant, since it's the default/recommended variant
-            if [ "$variant" = "ac" ]; then
-              tags+=$'\n'"${image}:latest"
+            # "ac" is the default/recommended variant, so it also owns plain "latest"
+            if [ "$VARIANT" = "ac" ]; then
+              tags+=$'\n'"${IMAGE}:latest"
             fi
           fi
 
@@ -148,33 +172,47 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+          context: .
           push: true
           platforms: ${{ matrix.platforms }}
           build-args: |
             VARIANT=${{ matrix.variant }}
             IMAGE_TAG=${{ needs.check.outputs.version }}
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Separate cache per variant so the matrix jobs don't overwrite each other
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,scope=${{ matrix.variant }},mode=max
 
   record:
     needs: [check, build]
-    if: needs.check.outputs.should_build == 'true' && needs.build.result == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.version == '')
+    # Record only after a successful build of the current upstream release.
+    # (Manually building an old version won't rewind the state file.)
+    if: >-
+      needs.build.result == 'success' &&
+      needs.check.outputs.version == needs.check.outputs.latest_version
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Record built upstream release
-        run: |
-          printf '%s\n' '${{ needs.check.outputs.version }}' > .github/last_upstream_release.txt
-
-      - name: Commit updated state
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
+
+          printf '%s\n' "$VERSION" > "$STATE_FILE"
+
+          git add "$STATE_FILE"
+          if git diff --cached --quiet; then
+            echo "State file already up to date."
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .github/last_upstream_release.txt
-          git commit -m "chore: built Copyparty ${{ needs.check.outputs.version }}" || exit 0
+          git commit -m "chore: built Copyparty ${VERSION}"
           git push
