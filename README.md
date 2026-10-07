@@ -1,5 +1,6 @@
-# patentparty
-### copyparty with patent-restricted features added back in
+# copypinny
+## a fork of patentparty
+### (copyparty with patent-restricted features added back in)
 
 patentparty is a drop-in replacement for the official Docker image of [copyparty](https://github.com/9001/copyparty).  
 It adds back in H265/HEVC, HEIF and non-LC AAC support.  
@@ -8,6 +9,7 @@ due to [wanting to avoid patent issues](https://github.com/9001/copyparty/blob/h
 
 All credits for the copyparty application go to the original author, [ed, "9001"](https://github.com/9001).
 
+RAW image support is hopefully fixed and added in by slightly tweaking the build process, since the base should already have RAW support
 
 # Docker Images
 This repo only builds docker images (since it's the only real affected platform)  
