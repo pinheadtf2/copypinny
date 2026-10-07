@@ -42,7 +42,6 @@ RUN set -eux; \
         grep -qiE '^[[:space:]]*V.*[[:space:]]hevc[[:space:]]'; \
     \
     # Verify RAW support is actually available.
-        # Verify RAW support is actually available.
     # dcraw_emu exits 1 after printing usage, so only fail on "not runnable"
     # (127 = missing binary/library, 126 = not executable, >128 = crash).
     command -v dcraw_emu; \
